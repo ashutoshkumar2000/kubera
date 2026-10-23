@@ -1,13 +1,15 @@
-import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
+import { env } from "./config/env.js";
+import { balancesRouter } from "./modules/balances/balances.routes.js";
+import { errorHandler } from "./middleware/error-handler.js";
 
 const app = express();
 
 app.use(helmet());
 app.use(cors({ origin: "http://localhost:4200" }));
-app.use(express.json());
+app.use(express.json({ limit: "100kb" }));
 
 app.get("/api/health", (_req, res) => {
   res.json({
@@ -16,8 +18,11 @@ app.get("/api/health", (_req, res) => {
   });
 });
 
-const port = Number(process.env.PORT ?? 3000);
+app.use("/api/airwallex/balances", balancesRouter);
 
-app.listen(port, () => {
-  console.log(`KUBERA API listening on port ${port}`);
+// Error handler must come after route registration.
+app.use(errorHandler);
+
+app.listen(env.PORT, () => {
+  console.log(`KUBERA API listening on port ${env.PORT}`);
 });
