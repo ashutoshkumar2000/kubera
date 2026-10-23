@@ -1,0 +1,16 @@
+{
+  "name": "kubera",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:web": "npm run start --workspace=@kubera/web",
+    "dev:api": "npm run dev --workspace=@kubera/api"
+  },
+  "overrides": {
+    "vitest": "4.1.11"
+  }
+}
