@@ -1,4 +1,3 @@
-
 import { Router } from "express";
 import { AppError } from "../../middleware/app-error.js";
 import { reconciliationRunRequestSchema } from "./reconciliation.schema.js";
@@ -10,18 +9,13 @@ reconciliationRouter.post("/run", async (req, res, next) => {
   const parsed = reconciliationRunRequestSchema.safeParse(req.body);
 
   if (!parsed.success) {
-    return next(
-      new AppError(400, "Invalid reconciliation request"),
-    );
+    return next(new AppError(400, "Invalid reconciliation request"));
   }
 
   try {
-    const result = await runReconciliation(parsed.data.asOf);
-
+    const result = await runReconciliation(parsed.data);
     return res.json(result);
   } catch (error) {
-    // The centralized error handler will log internal details and
-    // return a safe response to the client.
     return next(error);
   }
 });

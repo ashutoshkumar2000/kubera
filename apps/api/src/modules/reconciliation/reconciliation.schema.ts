@@ -69,11 +69,27 @@ export const reconciliationRequestSchema = z
         });
     });
 
-export const reconciliationRunRequestSchema = z
-    .object({
-        asOf: dateTimeSchema,
-    })
-    .strict();
+export const reconciliationRunRequestSchema = z.discriminatedUnion(
+    "mode",
+    [
+        z.object({
+            mode: z.literal("live"),
+        }).strict(),
+
+        z.object({
+            mode: z.literal("historical"),
+            asOf: dateTimeSchema,
+        }).strict(),
+    ],
+);
+
+export type ReconciliationMode = z.infer<
+    typeof reconciliationRunRequestSchema
+>["mode"];
+
+export type ReconciliationRunRequest = z.infer<
+    typeof reconciliationRunRequestSchema
+>;
 
 export type ExpectedEvent = z.infer<typeof expectedEventSchema>;
 export type Observation = z.infer<typeof observationSchema>;

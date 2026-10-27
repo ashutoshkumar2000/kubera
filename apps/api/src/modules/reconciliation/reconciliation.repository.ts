@@ -3,6 +3,7 @@ import { pool } from "../../config/database.js";
 import {
     reconciliationRequestSchema,
     type ReconciliationRequest,
+    ReconciliationMode,
 } from "./reconciliation.schema.js";
 import type { ReconciliationFinding } from "./reconciliation.service.js";
 import type { Observation } from "./reconciliation.schema.js";
@@ -118,25 +119,26 @@ export async function loadReconciliationInputs(
 
 
 export async function createReconciliationRun(
-  asOf: string,
+    asOf: string,
+    mode: ReconciliationMode,
 ): Promise<string> {
-  const result = await pool.query<{ id: string }>(
-    `
-      INSERT INTO reconciliation_runs (as_of, status)
-      VALUES ($1, 'running')
+    const result = await pool.query<{ id: string }>(
+        `
+      INSERT INTO reconciliation_runs (as_of, status, mode)
+      VALUES ($1, 'running', $2)
       RETURNING id
     `,
-    [asOf],
-  );
+        [asOf, mode],
+    );
 
-  return result.rows[0].id;
+    return result.rows[0].id;
 }
 
 export async function markReconciliationRunFailed(
-  runId: string,
+    runId: string,
 ): Promise<void> {
-  await pool.query(
-    `
+    await pool.query(
+        `
       UPDATE reconciliation_runs
       SET status = 'failed',
           completed_at = NOW(),
@@ -144,48 +146,49 @@ export async function markReconciliationRunFailed(
       WHERE id = $1
         AND status = 'running'
     `,
-    [runId],
-  );
+        [runId],
+    );
 }
 
 function getFindingFingerprint(
-  finding: ReconciliationFinding,
+    finding: ReconciliationFinding,
 ): string {
-  // The same event and finding type identify the same issue.
-  return JSON.stringify([finding.eventId, finding.type]);
+    // The same event and finding type identify the same issue.
+    return JSON.stringify([finding.eventId, finding.type]);
 }
 
 function getLatestObservations(
-  observations: Observation[],
+    observations: Observation[],
 ): Map<string, Observation> {
-  const latestByEvent = new Map<string, Observation>();
+    const latestByEvent = new Map<string, Observation>();
 
-  for (const observation of observations) {
-    const previous = latestByEvent.get(observation.eventId);
+    for (const observation of observations) {
+        const previous = latestByEvent.get(observation.eventId);
 
-    if (
-      !previous ||
-      Date.parse(observation.observedAt) >
-        Date.parse(previous.observedAt)
-    ) {
-      latestByEvent.set(observation.eventId, observation);
+        if (
+            !previous ||
+            Date.parse(observation.observedAt) >
+            Date.parse(previous.observedAt)
+        ) {
+            latestByEvent.set(observation.eventId, observation);
+        }
     }
-  }
 
-  return latestByEvent;
+    return latestByEvent;
 }
 
 export async function persistReconciliationResults(
   runId: string,
   input: ReconciliationRequest,
   findings: ReconciliationFinding[],
+  mode: ReconciliationMode,
 ): Promise<void> {
   const client = await pool.connect();
 
   try {
     await client.query("BEGIN");
 
-    // Record which expected events this run evaluated.
+    // Record expected events evaluated by this run.
     for (const event of input.expectedEvents) {
       await client.query(
         `
@@ -197,7 +200,7 @@ export async function persistReconciliationResults(
       );
     }
 
-    // Record which observations this run used.
+    // Record observations used by this run.
     for (const observation of input.observations) {
       await client.query(
         `
@@ -210,165 +213,112 @@ export async function persistReconciliationResults(
       );
     }
 
-    const fingerprints = findings.map(getFindingFingerprint);
+    if (mode === "historical") {
+      // Historical runs save snapshots ONLY.
+      // They must never write to or resolve live findings.
+      for (const finding of findings) {
+        const fingerprint = getFindingFingerprint(finding);
 
-    // Create new findings or update the existing issue.
-    for (const finding of findings) {
-      const fingerprint = getFindingFingerprint(finding);
+        const status =
+          finding.type === "EVENT_OBSERVED_LATE"
+            ? "resolved"
+            : "open";
 
-      // A late-confirmation finding describes a past event,
-      // rather than an issue that still needs action.
-      const status =
-        finding.type === "EVENT_OBSERVED_LATE"
-          ? "resolved"
-          : "open";
-
-      const saved = await client.query<{ id: string }>(
-        `
-          INSERT INTO findings (
-            fingerprint,
-            event_id,
-            finding_type,
-            severity,
-            title,
-            description,
-            status,
-            first_detected_at,
-            last_detected_at,
-            resolved_at,
-            last_seen_run_id,
-            created_at,
-            updated_at
-          )
-          VALUES (
-            $1, $2, $3, $4, $5, $6, $7,
-            NOW(), NOW(),
-            CASE WHEN $7 = 'resolved' THEN NOW() ELSE NULL END,
-            $8, NOW(), NOW()
-          )
-          ON CONFLICT (fingerprint)
-          DO UPDATE SET
-            event_id = EXCLUDED.event_id,
-            finding_type = EXCLUDED.finding_type,
-            severity = EXCLUDED.severity,
-            title = EXCLUDED.title,
-            description = EXCLUDED.description,
-            first_detected_at = CASE
-              WHEN findings.status = 'resolved'
-                AND EXCLUDED.status = 'open'
-              THEN NOW()
-              ELSE findings.first_detected_at
-            END,
-            last_detected_at = NOW(),
-            status = EXCLUDED.status,
-            resolved_at = EXCLUDED.resolved_at,
-            last_seen_run_id = EXCLUDED.last_seen_run_id,
-            updated_at = NOW()
-          RETURNING id
-        `,
-        [
-          fingerprint,
-          finding.eventId,
-          finding.type,
-          finding.severity,
-          finding.title,
-          finding.description,
-          status,
-          runId,
-        ],
-      );
-
-      const findingId = saved.rows[0].id;
-
-      await client.query(
-        `
-          INSERT INTO reconciliation_run_findings (
-            run_id,
-            finding_id,
-            finding_snapshot
-          )
-          VALUES ($1, $2, $3::jsonb)
-          ON CONFLICT (run_id, finding_id)
-          DO UPDATE SET finding_snapshot = EXCLUDED.finding_snapshot
-        `,
-        [
-          runId,
-          findingId,
-          JSON.stringify({
-            ...finding,
-            fingerprint,
-            status,
-          }),
-        ],
-      );
-    }
-
-    // A confirmed or explicitly failed observation can replace an
-    // older "unconfirmed" finding with a more accurate result.
-    // Pending or missing evidence is not sufficient to resolve it.
-    const latestByEvent = getLatestObservations(input.observations);
-
-    const conclusiveEventIds = input.expectedEvents
-      .filter((event) => {
-        const observation = latestByEvent.get(event.id);
-
-        return (
-          observation !== undefined &&
-          observation.type === event.type &&
-          (observation.status === "confirmed" ||
-            observation.status === "failed") &&
-          Date.parse(observation.observedAt) <= Date.parse(input.asOf)
-        );
-      })
-      .map((event) => event.id);
-
-    if (conclusiveEventIds.length > 0) {
-      const staleResult = await client.query<{
-        id: string;
-        fingerprint: string;
-        event_id: string;
-        finding_type: string;
-        severity: string;
-        title: string;
-        description: string;
-      }>(
-        `
-          SELECT
-            id,
-            fingerprint,
-            event_id,
-            finding_type,
-            severity,
-            title,
-            description
-          FROM findings
-          WHERE event_id = ANY($1::text[])
-            AND status = 'open'
-            AND NOT (fingerprint = ANY($2::text[]))
-            AND last_detected_at <= $3::timestamptz
-          FOR UPDATE
-        `,
-        [conclusiveEventIds, fingerprints, input.asOf],
-      );
-
-      for (const stale of staleResult.rows) {
-        const resolved = await client.query(
+        await client.query(
           `
-            UPDATE findings
-            SET status = 'resolved',
-                resolved_at = NOW(),
-                last_seen_run_id = $2,
-                updated_at = NOW()
-            WHERE id = $1
-              AND status = 'open'
+            INSERT INTO reconciliation_run_findings (
+              run_id,
+              finding_id,
+              snapshot_key,
+              finding_snapshot
+            )
+            VALUES ($1, NULL, $2, $3::jsonb)
+            ON CONFLICT (run_id, snapshot_key)
+              WHERE finding_id IS NULL
+            DO UPDATE SET
+              finding_snapshot = EXCLUDED.finding_snapshot
+          `,
+          [
+            runId,
+            fingerprint,
+            JSON.stringify({
+              ...finding,
+              fingerprint,
+              status,
+              mode: "historical",
+            }),
+          ],
+        );
+      }
+    } else {
+      // Everything below is LIVE-only.
+      const fingerprints = findings.map(getFindingFingerprint);
+
+      // Create new findings or update existing live findings.
+      for (const finding of findings) {
+        const fingerprint = getFindingFingerprint(finding);
+
+        const status =
+          finding.type === "EVENT_OBSERVED_LATE"
+            ? "resolved"
+            : "open";
+
+        const saved = await client.query<{ id: string }>(
+          `
+            INSERT INTO findings (
+              fingerprint,
+              event_id,
+              finding_type,
+              severity,
+              title,
+              description,
+              status,
+              first_detected_at,
+              last_detected_at,
+              resolved_at,
+              last_seen_run_id,
+              created_at,
+              updated_at
+            )
+            VALUES (
+              $1, $2, $3, $4, $5, $6, $7,
+              NOW(), NOW(),
+              CASE WHEN $7 = 'resolved' THEN NOW() ELSE NULL END,
+              $8, NOW(), NOW()
+            )
+            ON CONFLICT (fingerprint)
+            DO UPDATE SET
+              event_id = EXCLUDED.event_id,
+              finding_type = EXCLUDED.finding_type,
+              severity = EXCLUDED.severity,
+              title = EXCLUDED.title,
+              description = EXCLUDED.description,
+              first_detected_at = CASE
+                WHEN findings.status = 'resolved'
+                  AND EXCLUDED.status = 'open'
+                THEN NOW()
+                ELSE findings.first_detected_at
+              END,
+              last_detected_at = NOW(),
+              status = EXCLUDED.status,
+              resolved_at = EXCLUDED.resolved_at,
+              last_seen_run_id = EXCLUDED.last_seen_run_id,
+              updated_at = NOW()
             RETURNING id
           `,
-          [stale.id, runId],
+          [
+            fingerprint,
+            finding.eventId,
+            finding.type,
+            finding.severity,
+            finding.title,
+            finding.description,
+            status,
+            runId,
+          ],
         );
 
-        if (resolved.rowCount === 0) {
-          continue;
-        }
+        const findingId = saved.rows[0].id;
 
         await client.query(
           `
@@ -379,28 +329,126 @@ export async function persistReconciliationResults(
             )
             VALUES ($1, $2, $3::jsonb)
             ON CONFLICT (run_id, finding_id)
-            DO UPDATE SET finding_snapshot = EXCLUDED.finding_snapshot
+              WHERE finding_id IS NOT NULL
+            DO UPDATE SET
+              finding_snapshot = EXCLUDED.finding_snapshot
           `,
           [
             runId,
-            stale.id,
+            findingId,
             JSON.stringify({
-              id: stale.id,
-              fingerprint: stale.fingerprint,
-              eventId: stale.event_id,
-              type: stale.finding_type,
-              severity: stale.severity,
-              title: stale.title,
-              description: stale.description,
-              status: "resolved",
-              resolutionReason: "Superseded by a newer conclusive observation",
+              ...finding,
+              fingerprint,
+              status,
+              mode: "live",
             }),
           ],
         );
       }
+
+      // Resolve older open findings only when there is conclusive
+      // evidence for the corresponding expected event.
+      const latestByEvent = getLatestObservations(input.observations);
+
+      const conclusiveEventIds = input.expectedEvents
+        .filter((event) => {
+          const observation = latestByEvent.get(event.id);
+
+          return (
+            observation !== undefined &&
+            observation.type === event.type &&
+            (observation.status === "confirmed" ||
+              observation.status === "failed") &&
+            Date.parse(observation.observedAt) <=
+              Date.parse(input.asOf)
+          );
+        })
+        .map((event) => event.id);
+
+      if (conclusiveEventIds.length > 0) {
+        const staleResult = await client.query<{
+          id: string;
+          fingerprint: string;
+          event_id: string;
+          finding_type: string;
+          severity: string;
+          title: string;
+          description: string;
+        }>(
+          `
+            SELECT
+              id,
+              fingerprint,
+              event_id,
+              finding_type,
+              severity,
+              title,
+              description
+            FROM findings
+            WHERE event_id = ANY($1::text[])
+              AND status = 'open'
+              AND NOT (fingerprint = ANY($2::text[]))
+              AND last_detected_at <= $3::timestamptz
+            FOR UPDATE
+          `,
+          [conclusiveEventIds, fingerprints, input.asOf],
+        );
+
+        for (const stale of staleResult.rows) {
+          const resolved = await client.query(
+            `
+              UPDATE findings
+              SET status = 'resolved',
+                  resolved_at = NOW(),
+                  last_seen_run_id = $2,
+                  updated_at = NOW()
+              WHERE id = $1
+                AND status = 'open'
+              RETURNING id
+            `,
+            [stale.id, runId],
+          );
+
+          if (resolved.rowCount === 0) {
+            continue;
+          }
+
+          await client.query(
+            `
+              INSERT INTO reconciliation_run_findings (
+                run_id,
+                finding_id,
+                finding_snapshot
+              )
+              VALUES ($1, $2, $3::jsonb)
+              ON CONFLICT (run_id, finding_id)
+                WHERE finding_id IS NOT NULL
+              DO UPDATE SET
+                finding_snapshot = EXCLUDED.finding_snapshot
+            `,
+            [
+              runId,
+              stale.id,
+              JSON.stringify({
+                id: stale.id,
+                fingerprint: stale.fingerprint,
+                eventId: stale.event_id,
+                type: stale.finding_type,
+                severity: stale.severity,
+                title: stale.title,
+                description: stale.description,
+                status: "resolved",
+                mode: "live",
+                resolutionReason:
+                  "Superseded by a newer conclusive observation",
+              }),
+            ],
+          );
+        }
+      }
     }
 
-    // Mark the run complete only after its records are saved.
+    // Both modes record successful completion.
     await client.query(
       `
         UPDATE reconciliation_runs
