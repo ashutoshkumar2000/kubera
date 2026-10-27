@@ -5,6 +5,7 @@
   "main": "index.js",
   "scripts": {
     "test": "tsx --test src/modules/reconciliation/reconciliation.test.ts",
+    "test:db": "tsx --test src/modules/reconciliation/reconciliation.persistence.test.ts",
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js"
